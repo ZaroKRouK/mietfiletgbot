@@ -1,312 +1,381 @@
 import json
-import asyncio
 import logging
 import os
+import asyncio
+import tempfile
 from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile, CallbackQuery
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 
-# Настройка первичная
+from config import BOT_TOKEN, API_BASE_URL, CLIENT_USERNAME, CLIENT_PASSWORD, USERS_FILE, FILES_FILE, TEMP_DIR
+from api_client import FileServerClient
+
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler("bot_logs.txt", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
+    handlers=[logging.FileHandler("bot_logs.txt", encoding="utf-8"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
-TOKEN = "TOKEN"
-USERS_FILE = "users.json"
-FILES_FILE = "files.json"
-UPLOADS_DIR = "uploads"
-
-bot = Bot(token=TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Пользователи
-users = []
+# Глобальные хранилища
+users_db = {}       # { tg_id: {"server_username": str, "server_password": str, "full_name": str, ...} }
+files_meta = {}     # { fid: {"original_name": str, "uploader_id": int, "file_size": int, "upload_time": str} }
+next_file_id = 1    # не используется, fid генерируется сервером
+
+# Клиент для API от имени CLIENT (для создания USER)
+client_api = FileServerClient(API_BASE_URL, CLIENT_USERNAME, CLIENT_PASSWORD)
 
 
+# ========== Работа с локальными JSON ==========
 def load_users():
-    global users
-    try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            users = json.load(f)
-    except:
-        users = []
+    global users_db
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users_db = json.load(f)
+                # преобразуем ключи из строк в int
+                users_db = {int(k): v for k, v in users_db.items()}
+        except Exception as e:
+            logger.error(f"Ошибка загрузки {USERS_FILE}: {e}")
+            users_db = {}
+    else:
+        users_db = {}
 
 
 def save_users():
     try:
         with open(USERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, ensure_ascii=False, indent=2)
+            json.dump(users_db, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Ошибка сохранения users.json: {e}")
-
-
-def register_user(user_id: int, username: str = None, full_name: str = None):
-    for user in users:
-        if user["tg_id"] == user_id:
-            user.update({
-                "username": username,
-                "full_name": full_name,
-                "last_login": datetime.now().isoformat(),
-                "login_count": user.get("login_count", 0) + 1
-            })
-            save_users()
-            return user
-
-    new_user = {
-        "tg_id": user_id,
-        "username": username,
-        "full_name": full_name,
-        "first_login": datetime.now().isoformat(),
-        "last_login": datetime.now().isoformat(),
-        "login_count": 1
-    }
-    users.append(new_user)
-    save_users()
-    return new_user
-
-
-def get_user_name(user_id: int):
-    for u in users:
-        if u["tg_id"] == user_id:
-            return u.get("full_name") or f"ID {user_id}", u.get("username")
-    return f"ID {user_id}", None
-
-
-# Файлы
-files_metadata = {}
-next_file_id = 1
+        logger.error(f"Ошибка сохранения {USERS_FILE}: {e}")
 
 
 def load_files():
-    global files_metadata, next_file_id
-    os.makedirs(UPLOADS_DIR, exist_ok=True)
-    try:
-        with open(FILES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        files_metadata = {item["id"]: item for item in data}
-        next_file_id = max(files_metadata.keys(), default=0) + 1
-    except:
-        files_metadata = {}
-        next_file_id = 1
+    global files_meta
+    if os.path.exists(FILES_FILE):
+        try:
+            with open(FILES_FILE, "r", encoding="utf-8") as f:
+                files_meta = json.load(f)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки {FILES_FILE}: {e}")
+            files_meta = {}
+    else:
+        files_meta = {}
 
 
 def save_files():
     try:
         with open(FILES_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(files_metadata.values()), f, ensure_ascii=False, indent=2)
+            json.dump(files_meta, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error(f"Ошибка сохранения files.json: {e}")
+        logger.error(f"Ошибка сохранения {FILES_FILE}: {e}")
 
 
-# Загрузка файлов
-@dp.message(F.document)
-async def upload_file(message: Message):
-    register_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+# ========== Вспомогательные функции ==========
+async def ensure_user_registered(tg_id: int, tg_username: str = None, full_name: str = None) -> FileServerClient:
+    """
+    Проверяет, зарегистрирован ли пользователь на сервере.
+    Если нет – создаёт USER через CLIENT API и сохраняет учётные данные.
+    Возвращает клиент API, авторизованный под этим USER.
+    """
+    if tg_id in users_db:
+        # уже есть учётные данные
+        creds = users_db[tg_id]
+        return FileServerClient(API_BASE_URL, creds["server_username"], creds["server_password"])
 
-    document = message.document
-    original_name = document.file_name or f"file_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # Создаём нового USER на сервере
+    # Используем username = tg_{id} или tg_username, если он есть
+    server_username = f"tg_{tg_id}" if not tg_username else f"tg_{tg_username}"
+    # но username на сервере должен быть уникальным, добавим суффикс
+    server_username = f"{server_username}_{tg_id}"  # гарантия уникальности
 
-    file_info = await bot.get_file(document.file_id)
+    try:
+        user_name, user_pass = await client_api.create_user(server_username)
+        logger.info(f"Создан USER на сервере: {user_name} для tg_id {tg_id}")
+    except Exception as e:
+        logger.error(f"Ошибка создания USER: {e}")
+        raise Exception("Не удалось зарегистрировать вас на сервере. Попробуйте позже.")
 
-    global next_file_id
-    file_id = next_file_id
-    next_file_id += 1
-
-    safe_filename = f"{file_id}_{original_name}"
-    file_path = os.path.join(UPLOADS_DIR, safe_filename)
-
-    await bot.download_file(file_info.file_path, file_path)
-
-    metadata = {
-        "id": file_id,
-        "original_name": original_name,
-        "file_path": file_path,
-        "uploader_id": message.from_user.id,
-        "upload_time": datetime.now().isoformat(),
-        "file_size": document.file_size
+    # Сохраняем в локальную БД
+    users_db[tg_id] = {
+        "server_username": user_name,
+        "server_password": user_pass,
+        "tg_username": tg_username,
+        "full_name": full_name,
+        "first_login": datetime.now().isoformat(),
+        "last_login": datetime.now().isoformat(),
+        "login_count": 1
     }
-    files_metadata[file_id] = metadata
-    save_files()
+    save_users()
 
-    await message.answer(
-        f"✅ <b>Файл успешно сохранён!</b>\n\n"
-        f"Название: {original_name}\n"
-        f"ID файла: <b>{file_id}</b>",
-        parse_mode="HTML"
-    )
+    return FileServerClient(API_BASE_URL, user_name, user_pass)
 
 
-# Команды
+def get_user_client(tg_id: int) -> FileServerClient:
+    """Возвращает API-клиент для уже зарегистрированного пользователя"""
+    if tg_id not in users_db:
+        raise ValueError("Пользователь не зарегистрирован")
+    creds = users_db[tg_id]
+    return FileServerClient(API_BASE_URL, creds["server_username"], creds["server_password"])
 
+
+# ========== Обработчики команд ==========
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    register_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
-    await message.answer(
-        f"Привет, {message.from_user.full_name}!\n\n"
-        f"Отправь мне файл — я сохраню его и выдам ID.\n"
-        f"Напиши <code>/help</code> для списка всех команд.",
-        parse_mode="HTML"
-    )
+    tg_id = message.from_user.id
+    try:
+        await ensure_user_registered(tg_id, message.from_user.username, message.from_user.full_name)
+        await message.answer(
+            f"Привет, {message.from_user.full_name}!\n\n"
+            f"Я работаю с файловым сервером. Отправь мне любой документ – он загрузится в твоё личное облако.\n"
+            f"Команды: /help, /files, /myfiles, /get <ID>"
+        )
+    except Exception as e:
+        logger.exception("Ошибка регистрации")
+        await message.answer("❌ Ошибка регистрации. Попробуйте позже.")
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     text = (
         "<b>📋 Доступные команды:</b>\n\n"
-        "• <code>/start</code> — приветствие\n"
-        "• <code>/help</code> — показать это сообщение\n"
-        "• <code>/files</code> — список всех файлов\n"
-        "• <code>/myfiles</code> — только твои файлы\n"
-        "• <code>/get ID</code> — запросить файл по ID\n"
-        "• <code>/del ID</code> — удалить свой файл\n\n"
-        "<b>Как работать:</b>\n"
-        "1. Отправь любой файл\n"
-        "2. Получи ID\n"
-        "3. Другие могут запросить его через /get\n"
-        "4. Ты можешь управлять своими файлами через /myfiles и /del"
+        "• /start – регистрация\n"
+        "• /help – это сообщение\n"
+        "• /files – список всех файлов (из локального кэша)\n"
+        "• /myfiles – только твои файлы\n"
+        "• /get <ID> – получить файл по идентификатору (если чужой – запросишь разрешение)\n\n"
+        "<b>Как загрузить файл:</b>\n"
+        "Просто отправь файл в чат – он загрузится на сервер и ты получишь его ID."
     )
     await message.answer(text, parse_mode="HTML")
 
 
+@dp.message(F.document)
+async def handle_document(message: Message):
+    tg_id = message.from_user.id
+    # Регистрируем пользователя, если он новый
+    try:
+        user_api = await ensure_user_registered(tg_id, message.from_user.username, message.from_user.full_name)
+    except Exception as e:
+        await message.answer("❌ Сначала зарегистрируйтесь через /start")
+        return
+
+    document = message.document
+    original_name = document.file_name or f"file_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Скачиваем файл от Telegram
+    file_info = await bot.get_file(document.file_id)
+    file_bytes = await bot.download_file(file_info.file_path)
+    file_data = file_bytes.read()  # bytes
+
+    # Загружаем на сервер
+    try:
+        fid = await user_api.upload_file(file_data, original_name)
+        logger.info(f"Пользователь {tg_id} загрузил файл {original_name}, fid={fid}")
+    except Exception as e:
+        logger.exception("Ошибка загрузки на сервер")
+        await message.answer(f"❌ Ошибка загрузки файла: {e}")
+        return
+
+    # Сохраняем метаданные локально
+    files_meta[fid] = {
+        "original_name": original_name,
+        "uploader_id": tg_id,
+        "file_size": document.file_size,
+        "upload_time": datetime.now().isoformat()
+    }
+    save_files()
+
+    await message.answer(
+        f"✅ Файл <b>{original_name}</b> загружен на сервер!\n"
+        f"Его ID: <code>{fid}</code>\n"
+        f"Вы можете поделиться этим ID с другими.",
+        parse_mode="HTML"
+    )
+
+
 @dp.message(Command("files"))
 async def cmd_files(message: Message):
-    if not files_metadata:
+    if not files_meta:
         await message.answer("📂 Пока нет загруженных файлов.")
         return
 
-    text = "<b>Все файлы в боте:</b>\n\n"
-    for fid, meta in sorted(files_metadata.items()):
-        owner_name, owner_user = get_user_name(meta["uploader_id"])
+    text = "<b>Все файлы в системе:</b>\n\n"
+    for fid, meta in sorted(files_meta.items(), key=lambda x: x[1]["upload_time"], reverse=True):
+        owner_id = meta["uploader_id"]
+        owner_name = users_db.get(owner_id, {}).get("full_name", f"User {owner_id}")
         size_mb = meta["file_size"] / (1024 * 1024)
-        text += f"<b>ID {fid}</b> — {meta['original_name']}\n   └─ {owner_name}{f' (@{owner_user})' if owner_user else ''}\n   └─ {size_mb:.2f} МБ\n\n"
+        text += f"🔹 <b>ID {fid}</b> – {meta['original_name']}\n   └─ Владелец: {owner_name}\n   └─ {size_mb:.2f} МБ\n\n"
 
-    await message.answer(text if len(text) < 4000 else text[:3900] + "\n...", parse_mode="HTML")
+    if len(text) > 4000:
+        text = text[:3900] + "\n..."
+    await message.answer(text, parse_mode="HTML")
 
 
 @dp.message(Command("myfiles"))
 async def cmd_myfiles(message: Message):
-    user_id = message.from_user.id
-    register_user(user_id, message.from_user.username, message.from_user.full_name)
-
-    my_files = {fid: meta for fid, meta in files_metadata.items() if meta["uploader_id"] == user_id}
-
+    tg_id = message.from_user.id
+    my_files = {fid: meta for fid, meta in files_meta.items() if meta["uploader_id"] == tg_id}
     if not my_files:
         await message.answer("У тебя пока нет загруженных файлов.")
         return
 
     text = f"<b>Твои файлы ({len(my_files)} шт.):</b>\n\n"
-    for fid, meta in sorted(my_files.items()):
+    for fid, meta in sorted(my_files.items(), key=lambda x: x[1]["upload_time"], reverse=True):
         size_mb = meta["file_size"] / (1024 * 1024)
         text += (
-            f"<b>ID {fid}</b> — {meta['original_name']}\n"
+            f"🔹 <b>ID {fid}</b> – {meta['original_name']}\n"
             f"   └─ Размер: {size_mb:.2f} МБ\n"
             f"   └─ Загружен: {meta['upload_time'][:10]}\n\n"
         )
-
     await message.answer(text, parse_mode="HTML")
-
-
-@dp.message(Command("del"))
-async def cmd_del(message: Message):
-    user_id = message.from_user.id
-    try:
-        parts = message.text.strip().split(maxsplit=1)
-        if len(parts) < 2:
-            await message.answer("❌ Использование: <code>/del 123</code>", parse_mode="HTML")
-            return
-
-        file_id = int(parts[1].strip())
-
-        if file_id not in files_metadata:
-            await message.answer("❌ Файл с таким ID не найден.")
-            return
-
-        meta = files_metadata[file_id]
-
-        if meta["uploader_id"] != user_id:
-            await message.answer("❌ Это не твой файл. Ты можешь удалять только свои файлы.")
-            return
-
-        # Удаление файла с диска
-        if os.path.exists(meta["file_path"]):
-            os.remove(meta["file_path"])
-
-        # Удаление из словаря
-        del files_metadata[file_id]
-        save_files()
-
-        await message.answer(f"✅ Файл ID <b>{file_id}</b> успешно удалён.", parse_mode="HTML")
-        logger.info(f"Файл {file_id} удалён пользователем {user_id}")
-
-    except ValueError:
-        await message.answer("❌ ID файла должен быть числом.")
-    except Exception as e:
-        logger.error(f"Ошибка при удалении файла: {e}")
-        await message.answer("❌ Произошла ошибка при удалении.")
 
 
 @dp.message(Command("get"))
 async def cmd_get(message: Message):
-    register_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+    parts = message.text.strip().split()
+    if len(parts) != 2:
+        await message.answer("❌ Использование: /get <ID>")
+        return
 
-    try:
-        parts = message.text.strip().split(maxsplit=1)
-        if len(parts) < 2:
-            await message.answer("❌ Использование: <code>/get 123</code>", parse_mode="HTML")
+    fid = parts[1]
+    if fid not in files_meta:
+        await message.answer("❌ Файл с таким ID не найден в локальном кэше.")
+        return
+
+    meta = files_meta[fid]
+    requester_id = message.from_user.id
+    owner_id = meta["uploader_id"]
+
+    # Если запрашивающий – владелец
+    if requester_id == owner_id:
+        # Скачиваем файл с сервера под своими учётными данными
+        try:
+            user_api = get_user_client(requester_id)
+            file_bytes = await user_api.download_file(fid)
+        except Exception as e:
+            logger.exception("Ошибка скачивания")
+            await message.answer(f"❌ Не удалось скачать файл: {e}")
             return
 
-        file_id = int(parts[1].strip())
-        if file_id not in files_metadata:
-            await message.answer("❌ Файл не найден.")
-            return
-
-        metadata = files_metadata[file_id]
-        requester_id = message.from_user.id
-        owner_id = metadata["uploader_id"]
-
-        if requester_id == owner_id:
-            if not os.path.exists(metadata["file_path"]):
-                await message.answer("❌ Файл удалён с диска.")
-                return
+        # Сохраняем во временный файл и отправляем
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{meta['original_name']}") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
             await message.answer_document(
-                FSInputFile(metadata["file_path"]),
-                caption=f"Ваш файл: {metadata['original_name']}\nID: {file_id}"
+                FSInputFile(tmp_path, filename=meta["original_name"]),
+                caption=f"Ваш файл: {meta['original_name']}\nID: {fid}"
             )
+        finally:
+            os.unlink(tmp_path)
+        return
+
+    # Запрос чужого файла – отправляем уведомление владельцу
+    owner_info = users_db.get(owner_id)
+    if not owner_info:
+        await message.answer("❌ Владелец файла не найден в базе бота.")
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{fid}_{requester_id}")],
+        [InlineKeyboardButton(text="❌ Отказать", callback_data=f"deny_{fid}_{requester_id}")]
+    ])
+
+    await bot.send_message(
+        owner_id,
+        f"📨 <b>Запрос файла</b>\n\n"
+        f"Пользователь: {message.from_user.full_name}\n"
+        f"Запрашивает файл: {meta['original_name']} (ID {fid})\n"
+        f"Разрешить отправку?",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await message.answer("✅ Запрос отправлен владельцу. Он должен принять решение.")
+
+
+# ========== Обработка callback-запросов ==========
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery):
+    if callback.data.startswith("approve_"):
+        _, fid, requester_id_str = callback.data.split("_")
+        requester_id = int(requester_id_str)
+        owner_id = callback.from_user.id
+
+        # Проверка, что файл существует
+        if fid not in files_meta:
+            await callback.answer("Файл уже удалён из кэша")
+            await callback.message.edit_text("❌ Файл не найден.")
             return
 
-        # Запрос чужого файла
-        owner_name, _ = get_user_name(owner_id)
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{file_id}_{requester_id}")],
-            [InlineKeyboardButton(text="❌ Отказать", callback_data=f"deny_{file_id}_{requester_id}")]
-        ])
+        meta = files_meta[fid]
+        if meta["uploader_id"] != owner_id:
+            await callback.answer("Это не ваш файл!")
+            return
 
-        await bot.send_message(
-            owner_id,
-            f"📨 Запрос на файл ID <b>{file_id}</b>\n\n"
-            f"От: {message.from_user.full_name}\n"
-            f"Файл: {metadata['original_name']}\n\n"
-            f"Разрешить отправить?",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+        # Скачиваем файл от имени владельца
+        try:
+            owner_api = get_user_client(owner_id)
+            file_bytes = await owner_api.download_file(fid)
+        except Exception as e:
+            logger.exception("Ошибка скачивания при одобрении")
+            await callback.answer("Не удалось скачать файл")
+            await callback.message.edit_text(f"❌ Ошибка доступа к файлу: {e}")
+            return
 
-        await message.answer("✅ Запрос отправлен владельцу.")
+        # Отправляем запросившему
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{meta['original_name']}") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            await bot.send_document(
+                requester_id,
+                FSInputFile(tmp_path, filename=meta["original_name"]),
+                caption=f"✅ Владелец {callback.from_user.full_name} поделился файлом:\n{meta['original_name']}\nID: {fid}"
+            )
+        finally:
+            os.unlink(tmp_path)
 
-    except Exception as e:
-        logger.exception("Ошибка /get")
-        await message.answer("❌ Ошибка при обработке запроса.")
+        await callback.message.edit_text(f"✅ Вы разрешили отправку файла {meta['original_name']} пользователю.")
+        await callback.answer("Файл отправлен!")
+
+    elif callback.data.startswith("deny_"):
+        _, fid, requester_id_str = callback.data.split("_")
+        requester_id = int(requester_id_str)
+        owner_id = callback.from_user.id
+
+        if fid not in files_meta:
+            await callback.answer("Файл не найден")
+            await callback.message.edit_text("❌ Файл уже не существует.")
+            return
+
+        meta = files_meta[fid]
+        if meta["uploader_id"] != owner_id:
+            await callback.answer("Это не ваш файл!")
+            return
+
+        await bot.send_message(requester_id, f"❌ Владелец отказал в выдаче файла ID {fid}.")
+        await callback.message.edit_text(f"❌ Вы отказали в отправке файла {meta['original_name']}.")
+        await callback.answer("Отказано")
 
 
-# Фидбек
+# ========== Запуск ==========
+async def main():
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    load_users()
+    load_files()
+    logger.info("Бот запущен")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 @dp.callback_query()
 async def process_callback(callback: CallbackQuery):
     try:
