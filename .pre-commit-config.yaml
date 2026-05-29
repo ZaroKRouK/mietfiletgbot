@@ -1,0 +1,14 @@
+repos:
+  - repo: local
+    hooks:
+      - id: pylint
+        name: pylint
+        entry: pylint
+        language: system
+        types: [python]
+        require_serial: true
+        args: [
+          "-rn", # Только сообщения, без рейтинга
+          "-sn", # Без счёта
+          "--rcfile=.pylintrc", # Путь к вашему .pylintrc (опционально)
+        ]
